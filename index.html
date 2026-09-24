@@ -12,6 +12,7 @@
 <link rel="apple-touch-icon" href="icon-512.png">
 <title>La Pizarra de OPS</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <script src="https://identity.netlify.com/v1/netlify-identity-widget.js"></script>
 <style>
   :root {
@@ -3077,6 +3078,8 @@ function renderShipments() {
       </div>
     </div>`;
   }).join('');
+
+  setTimeout(initVesselMaps, 10);
 }
 
 function fmt(d) {
@@ -3447,26 +3450,19 @@ function duplicateShipment(id) {
 // ─── SEGUIMIENTO EN VIVO DEL BARCO ────────────────────────────────────────
 // La ficha del barco de VesselFinder/MarineTraffic ("ais/details/ships/...")
 // NO se puede incrustar en un <iframe> propio — esas webs lo bloquean a
-// propósito ("ha rechazado la conexión"). En cambio MarineTraffic sí ofrece
-// un widget de mapa oficial pensado justo para incrustarse en otras páginas
-// (ais/embed/...). Ese widget puede centrarse en un barco concreto, pero
-// necesita el "shipid" interno de MarineTraffic (el número que aparece en
-// links tipo marinetraffic.com/.../shipid:196463), no el IMO. Por eso: si el
-// link guardado en la ficha trae ese shipid, se incrusta el mapa en vivo
-// centrado en el barco; si no, se deja el botón que abre el seguimiento en
-// una pestaña nueva (generado a partir del link guardado, o si no hay, del
-// IMO o del nombre del barco).
+// propósito ("ha rechazado la conexión"). Tampoco vale el widget "oficial"
+// de mapa de MarineTraffic para centrarlo en un barco concreto: probado y
+// confirmado que necesita que TÚ le des ya la posición (lat/lon) para
+// centrarse ahí, no la averigua solo a partir del shipid ni del MMSI.
+// Por eso el mapa en vivo de verdad usa una fuente de datos AIS real
+// (VesselAPI, por IMO) a través de una función de Netlify que esconde la
+// clave — nunca se llama a esa API directamente desde el navegador. Para
+// cuidar la cuota gratuita (150 consultas/mes en total) solo se puede
+// actualizar la posición de cada barco 1 vez cada 24h.
+const POS_REFRESH_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 function cleanImo(raw) {
   if (!raw) return '';
   return raw.replace(/[^0-9]/g, '').trim();
-}
-function extractMtShipId(mtUrl) {
-  const m = String(mtUrl || '').match(/shipid[:=](\d+)/i);
-  return m ? m[1] : null;
-}
-function buildMtEmbedUrl(shipId) {
-  return 'https://www.marinetraffic.com/en/ais/embed/zoom:9/centery:0/centerx:0/maptype:1'
-    + '/shownames:true/mmsi:0/shipid:' + shipId + '/fleet:/fleet_id:/vtypes:/showmenu:false/remember:false';
 }
 function openVesselTracking(imo, mtUrl, vesselName) {
   let url = (mtUrl || '').trim();
@@ -3479,25 +3475,124 @@ function openVesselTracking(imo, mtUrl, vesselName) {
   }
   window.open(url, '_blank', 'noopener');
 }
+function canRefreshPosition(s) {
+  if (!s.lastPosAt) return true;
+  const t = new Date(s.lastPosAt).getTime();
+  if (isNaN(t)) return true;
+  return (Date.now() - t) >= POS_REFRESH_COOLDOWN_MS;
+}
+function hoursUntilNextRefresh(s) {
+  if (!s.lastPosAt) return 0;
+  const t = new Date(s.lastPosAt).getTime();
+  if (isNaN(t)) return 0;
+  const msLeft = POS_REFRESH_COOLDOWN_MS - (Date.now() - t);
+  return msLeft <= 0 ? 0 : Math.max(1, Math.ceil(msLeft / (60 * 60 * 1000)));
+}
+function timeAgo(iso) {
+  const t = new Date(iso).getTime();
+  if (isNaN(t)) return '';
+  const mins = Math.round((Date.now() - t) / 60000);
+  if (mins < 1) return 'ahora mismo';
+  if (mins < 60) return 'hace ' + mins + ' min';
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return 'hace ' + hours + 'h';
+  const days = Math.round(hours / 24);
+  return 'hace ' + days + (days === 1 ? ' día' : ' días');
+}
+async function refreshVesselPosition(id) {
+  const s = shipments.find(x => x.id === id);
+  if (!s) return;
+  const imo = cleanImo(s.imo);
+  if (!imo) { showToast('⚠ Añade el IMO en la ficha para poder consultar la posición.', true); return; }
+  if (!canRefreshPosition(s)) { showToast('⚠ Ya se actualizó hoy. Solo se puede 1 vez cada 24h por barco.', true); return; }
+  const btn = document.getElementById('pos-refresh-btn-' + id);
+  if (btn) { btn.disabled = true; btn.textContent = 'Consultando…'; }
+  try {
+    const resp = await fetch('/.netlify/functions/vessel-position?imo=' + encodeURIComponent(imo));
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok || data.error) throw new Error(data.error || ('Error ' + resp.status));
+    if (data.lat == null || data.lng == null) throw new Error('No se encontró posición para ese IMO');
+    s.lastPosLat = data.lat;
+    s.lastPosLng = data.lng;
+    s.lastPosSpeed = (data.speed != null) ? data.speed : null;
+    s.lastPosCourse = (data.course != null) ? data.course : null;
+    s.lastPosAt = new Date().toISOString();
+    fbSave(s);
+    showToast('✓ Posición actualizada');
+  } catch (e) {
+    showToast('⚠ No se pudo consultar la posición: ' + e.message, true);
+    if (btn) { btn.disabled = false; btn.textContent = '↻ ACTUALIZAR POSICIÓN'; }
+  }
+}
+// Crea/renueva los mapas Leaflet de los barcos con posición guardada. Se
+// llama tras cada renderShipments() porque el grid se reconstruye entero.
+let _vesselMapInstances = {};
+function initVesselMaps() {
+  if (typeof L === 'undefined') return;
+  // El icono por defecto de Leaflet referencia rutas relativas que no
+  // existen al cargar la librería desde un CDN — hay que apuntarlas a mano
+  // o el marcador del barco no se vería.
+  if (!L.Icon.Default._pizarraFixed) {
+    L.Icon.Default.mergeOptions({
+      iconRetinaUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-icon-2x.png',
+      iconUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-icon.png',
+      shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-shadow.png',
+    });
+    L.Icon.Default._pizarraFixed = true;
+  }
+  Object.values(_vesselMapInstances).forEach(m => { try { m.remove(); } catch (e) {} });
+  _vesselMapInstances = {};
+  shipments.forEach(s => {
+    if (s.lastPosLat == null || s.lastPosLng == null) return;
+    const el = document.getElementById('vessel-map-' + s.id);
+    if (!el) return;
+    try {
+      const map = L.map(el, { attributionControl: true }).setView([s.lastPosLat, s.lastPosLng], 6);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 18,
+        attribution: '© OpenStreetMap'
+      }).addTo(map);
+      const marker = L.marker([s.lastPosLat, s.lastPosLng]).addTo(map);
+      const bits = [];
+      if (s.lastPosSpeed != null) bits.push(s.lastPosSpeed + ' nudos');
+      if (s.lastPosAt) bits.push(timeAgo(s.lastPosAt));
+      marker.bindPopup('<b>' + (s.vessel || 'Barco') + '</b>' + (bits.length ? '<br>' + bits.join(' · ') : ''));
+      _vesselMapInstances[s.id] = map;
+    } catch (e) { /* si el contenedor aún no tiene tamaño, se ignora silenciosamente */ }
+  });
+}
 function buildMapSection(s) {
   if (!s.vessel) return '';
-  const shipId = extractMtShipId(s.mtUrl);
   const imoSafe = (s.imo || '').replace(/'/g, "\\'");
   const mtUrlSafe = (s.mtUrl || '').replace(/'/g, "\\'");
   const vesselSafe = (s.vessel || '').replace(/'/g, "\\'");
-  const btnHtml = `<button class="map-track-btn" onclick="event.stopPropagation();openVesselTracking('${imoSafe}','${mtUrlSafe}','${vesselSafe}')" style="display:flex;align-items:center;gap:8px;padding:10px 16px;margin:${shipId ? '8px 20px 8px' : '8px 20px'};border-radius:10px;background:rgba(22,163,74,0.10);border:1px solid rgba(22,163,74,0.35);color:#16a34a;font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:0.8px;cursor:pointer;transition:all 0.18s;width:calc(100% - 40px);justify-content:center;">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" style="flex-shrink:0;"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="1.5"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10A15.3 15.3 0 0 1 12 2z" stroke="currentColor" stroke-width="1.5"/><path d="M2 12h20" stroke="currentColor" stroke-width="1.5"/></svg>
-      <span>${shipId ? 'ABRIR EN MARINETRAFFIC' : 'VER BARCO EN VIVO'}</span>
-      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" style="flex-shrink:0;opacity:0.6;"><path d="M11 2h3v3M14 2L8 8M6 3H4a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-    </button>`;
-  if (!shipId) {
-    return `<div style="padding:0;border-bottom:1px solid var(--border);overflow:hidden;" onclick="event.stopPropagation()">${btnHtml}</div>`;
+  const cleanedImo = cleanImo(s.imo);
+  const externalBtn = `<button onclick="event.stopPropagation();openVesselTracking('${imoSafe}','${mtUrlSafe}','${vesselSafe}')" style="display:flex;align-items:center;gap:6px;padding:6px 12px;border-radius:8px;background:transparent;border:1px solid var(--border);color:var(--gray);font-family:var(--mono);font-size:10.5px;font-weight:600;letter-spacing:0.4px;cursor:pointer;white-space:nowrap;">Abrir en MarineTraffic ↗</button>`;
+
+  if (!cleanedImo) {
+    return `<div style="padding:12px 20px;border-bottom:1px solid var(--border);" onclick="event.stopPropagation()">
+      <div style="font-size:12px;color:var(--gray);margin-bottom:8px;">Añade el IMO en la ficha para ver la posición en vivo del barco.</div>
+      ${externalBtn}
+    </div>`;
   }
+
+  const hasPos = s.lastPosLat != null && s.lastPosLng != null;
+  const refreshOk = canRefreshPosition(s);
+  const lastUpdateText = s.lastPosAt ? 'Última actualización: ' + timeAgo(s.lastPosAt) : 'Sin consultar todavía';
+  const refreshBtn = refreshOk
+    ? `<button id="pos-refresh-btn-${s.id}" onclick="event.stopPropagation();refreshVesselPosition('${s.id}')" style="display:flex;align-items:center;gap:8px;padding:10px 16px;border-radius:10px;background:rgba(22,163,74,0.10);border:1px solid rgba(22,163,74,0.35);color:#16a34a;font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:0.8px;cursor:pointer;width:100%;justify-content:center;">↻ ACTUALIZAR POSICIÓN</button>`
+    : `<button disabled style="display:flex;align-items:center;gap:8px;padding:10px 16px;border-radius:10px;background:rgba(140,140,140,0.08);border:1px solid var(--border);color:var(--gray);font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:0.8px;width:100%;justify-content:center;cursor:not-allowed;">Disponible en ${hoursUntilNextRefresh(s)}h (máx. 1 vez/día)</button>`;
+
   return `<div style="padding:0;border-bottom:1px solid var(--border);overflow:hidden;" onclick="event.stopPropagation()">
-      <div style="margin:12px 20px 0;border-radius:10px;overflow:hidden;border:1px solid var(--border);background:#0b1220;">
-        <iframe src="${buildMtEmbedUrl(shipId)}" width="100%" height="220" style="border:0;display:block;" loading="lazy" referrerpolicy="no-referrer-when-downgrade" title="Mapa en vivo del barco"></iframe>
+      ${hasPos
+        ? `<div id="vessel-map-${s.id}" style="height:220px;margin:12px 20px 0;border-radius:10px;overflow:hidden;border:1px solid var(--border);background:#e8ecf3;"></div>`
+        : `<div style="height:90px;margin:12px 20px 0;border-radius:10px;border:1px dashed var(--border);display:flex;align-items:center;justify-content:center;color:var(--gray);font-size:12px;text-align:center;padding:0 16px;">Todavía no se ha consultado la posición de este barco</div>`
+      }
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 20px 0;flex-wrap:wrap;">
+        <span style="font-size:11px;color:var(--gray);font-family:var(--mono);">${lastUpdateText}</span>
+        ${externalBtn}
       </div>
-      ${btnHtml}
+      <div style="padding:10px 20px 12px;">${refreshBtn}</div>
     </div>`;
 }
 
@@ -4031,6 +4126,7 @@ firebase.auth().onAuthStateChanged(user => {
 
 
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
 <script>
 // ══════════════════════════════════════════════════════════════════════════
