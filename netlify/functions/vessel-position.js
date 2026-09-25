@@ -35,7 +35,9 @@ exports.handler = async function (event) {
     }
 
     const data = await resp.json();
-    const v = data.vessel || data;
+    // La API real devuelve los datos dentro de "vesselPosition" (no "vessel").
+    // Se dejan los otros nombres como red de seguridad por si cambia el formato.
+    const v = data.vesselPosition || data.vessel || data;
 
     if (v.latitude == null || v.longitude == null) {
       return { statusCode: 404, headers, body: JSON.stringify({ error: 'No se encontró posición para ese IMO' }) };
