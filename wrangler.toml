@@ -1,0 +1,21 @@
+# Configuración del Worker de la Pizarra de OPS.
+#
+# IMPORTANTE: el "name" de aquí abajo tiene que coincidir EXACTAMENTE con el
+# nombre de tu proyecto tal como aparece en el dashboard de Cloudflare
+# (Workers & Pages → tu proyecto). Por tu URL, https://pizarra-ops.vicentferri24.workers.dev,
+# el nombre debería ser "pizarra-ops" — pero entra al dashboard y confírmalo:
+# si no coincide exacto, el despliegue falla.
+name = "pizarra-ops"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+
+[assets]
+# Los archivos estáticos (index.html, iconos, manifest, etc.) están en la
+# raíz del repo, junto a este wrangler.toml.
+directory = "./"
+binding = "ASSETS"
+# Sin esto, Cloudflare solo llamaría a nuestro Worker si la ruta NO coincide
+# con ningún archivo estático. Como "/vessel-position" no es un archivo, en
+# teoría ya llegaría igual — pero lo dejamos explícito para que nunca dependa
+# de esa casualidad.
+run_worker_first = ["/vessel-position"]

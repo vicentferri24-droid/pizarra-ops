@@ -1,0 +1,7 @@
+src/
+wrangler.toml
+.assetsignore
+functions/
+package.json
+package-lock.json
+node_modules/
